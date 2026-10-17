@@ -1,0 +1,102 @@
+name: Deploy MCP Server to Cloud Run
+
+# Builds the repository's Dockerfile and deploys the MCP server (streamable-http transport) to Google Cloud Run.
+# One-time setup is described in `docs/deployment/cloud-run.md`. The job is skipped until the `GCP_PROJECT_ID`
+# repository variable is set, so forks without a Google Cloud project don't get a failing run.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cloud-run
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION || 'us-central1' }}
+  SERVICE: ${{ vars.CLOUD_RUN_SERVICE || 'scrapling-mcp' }}
+  REPOSITORY: ${{ vars.ARTIFACT_REGISTRY_REPOSITORY || 'scrapling' }}
+  TOKEN_SECRET: ${{ vars.MCP_TOKEN_SECRET_NAME || 'scrapling-mcp-token' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ vars.GCP_PROJECT_ID != '' }}
+    permissions:
+      contents: read
+      id-token: write  # Workload Identity Federation, so no long-lived service account key is stored in GitHub
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+    - name: Set up gcloud
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Resolve the image name
+      id: image
+      run: echo "name=${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/scrapling:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+    - name: Log in to Artifact Registry
+      run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push the image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.image.outputs.name }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Deploy to Cloud Run
+      env:
+        IMAGE: ${{ steps.image.outputs.name }}
+        ALLOWED_HOST: ${{ vars.MCP_ALLOWED_HOST }}
+        MAX_INSTANCES: ${{ vars.CLOUD_RUN_MAX_INSTANCES || '1' }}
+        MEMORY: ${{ vars.CLOUD_RUN_MEMORY || '2Gi' }}
+        CPU: ${{ vars.CLOUD_RUN_CPU || '2' }}
+      run: |
+        ARGS="mcp,--http,--host,0.0.0.0,--port,8000"
+        if [[ -n "$ALLOWED_HOST" ]]; then
+          ARGS="${ARGS},--allowed-host,${ALLOWED_HOST}"
+        fi
+
+        # The bearer token from Secret Manager is the server's own authentication, so Cloud Run's IAM check is
+        # left open. Browser sessions live in the instance's memory, which is why one instance with session
+        # affinity is the default, and the long timeout keeps streamed MCP responses from being cut off.
+        gcloud run deploy "$SERVICE" \
+          --project "$PROJECT_ID" \
+          --region "$REGION" \
+          --image "$IMAGE" \
+          --args "$ARGS" \
+          --port 8000 \
+          --memory "$MEMORY" \
+          --cpu "$CPU" \
+          --concurrency 10 \
+          --min-instances 0 \
+          --max-instances "$MAX_INSTANCES" \
+          --timeout 3600 \
+          --session-affinity \
+          --set-secrets "SCRAPLING_MCP_AUTH_TOKEN=${TOKEN_SECRET}:latest" \
+          --allow-unauthenticated \
+          --quiet
+
+    - name: Show the service URL
+      run: |
+        URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" --region "$REGION" --format 'value(status.url)')
+        echo "MCP endpoint: ${URL}/mcp" >> "$GITHUB_STEP_SUMMARY"
+        echo "MCP endpoint: ${URL}/mcp"
